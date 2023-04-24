@@ -1,0 +1,258 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+import copy
+from collections import deque, namedtuple
+import torch.nn.functional as F
+import time
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import matplotlib.pyplot as plt
+# Hyperparameters
+BATCH_SIZE = 128
+GAMMA = 0.99
+TAU = 0.005
+CRITIC_LR = 0.001
+ACTOR_LR = 0.0001
+BUFFER_SIZE = int(1e4)
+UPDATE_EVERY = 1
+SM_TAU = 1.0
+SM_TAU_MIN = 0.01
+SM_TAU_DECAY = 1-1e-5
+
+class Actor(nn.Module):
+    def __init__(self, state_size, action_size, seed):
+        super(Actor, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fc1 = nn.Linear(state_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_size)
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+        
+    def forward(self, state):
+        x = self.relu(self.fc1(state))
+        x = self.relu(self.fc2(x))
+        x = self.tanh(self.fc3(x))
+        return x
+
+class Critic(nn.Module):
+    def __init__(self, state_size, action_size, seed):
+        super(Critic, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fc1 = nn.Linear(state_size + action_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 1)
+        self.relu = nn.ReLU()
+        
+    def forward(self, state, action):
+        x = torch.cat((state, action), dim=1)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+"""tuple for storing a transition"""
+Transition = namedtuple(
+    'Transition', ('state', 'action', 'next_state', 'reward','done'))
+
+class ReplayBuffer:
+    def __init__(self, buffer_size, batch_size) -> None:
+        """Initialize memory"""
+        self.memory = deque([], maxlen=buffer_size)
+        self.batch_size = batch_size
+
+    def push(self, *args):
+        """Save a transition into memory"""
+        self.memory.append(Transition(*args))
+
+    def sample(self):
+        "Return a random memory"
+        return random.sample(self.memory, self.batch_size)
+
+    def __len__(self):
+        """Return number of stored memories"""
+        return len(self.memory)
+    
+class Agent:
+    def __init__(self, state_size, action_size, seed, name="default",path=None, load=False):
+        if isinstance(name,str):
+            self.name = name
+        else:
+            raise NameError("'name' expected a str but an {} was given.".format(type(name)))
+        
+        self.state_size = state_size
+        self.action_size = action_size
+
+        # Actor Network (w/ Target Network)
+        self.actor_local = Actor(state_size, action_size, seed).to(device)
+        self.actor_target = Actor(state_size, action_size, seed).to(device)
+        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=ACTOR_LR)
+
+        # Critic Network (w/ Target Network)
+        self.critic_local = Critic(state_size, action_size, seed).to(device)
+        self.critic_target = Critic(state_size, action_size, seed).to(device)
+        self.critic_optimizer = optim.Adam(self.critic_local.parameters(), lr=CRITIC_LR)
+
+        # # Noise process
+        self.noise = OUNoise(action_size)
+
+        # Replay memory
+        self.memory = ReplayBuffer(BUFFER_SIZE, BATCH_SIZE)
+
+        # Initialize time step (for updating every UPDATE_EVERY steps)
+        self.t_step = 0
+
+        # Initialize softmax temperature
+        self.SM_tau = SM_TAU
+        self.SM_tau_min = SM_TAU_MIN
+        self.SM_tau_decay = SM_TAU_DECAY
+
+    def step(self, state, action, reward, next_state, done):
+        self.memory.add(state, action, reward, next_state, done)
+        self.t_step = (self.t_step + 1) % UPDATE_EVERY
+
+        if len(self.memory) > BATCH_SIZE and self.t_step == 0:
+            for i in range(10):
+                experiences = self.memory.sample() 
+                self.learn(experiences, GAMMA)
+
+    def act(self, state, explore=True, scale = 1.0):
+        state = torch.FloatTensor(state).to(device)
+        with torch.no_grad():
+            action = self.actor_local(state).cpu().data.numpy()
+        if explore:
+            action += self.noise.sample(scale=scale)
+        return np.clip(action, -scale, scale)
+
+
+    def learn(self, experiences, gamma=GAMMA):
+        batch = Transition(*zip(*experiences))
+        states = torch.cat(batch.state)
+        actions = torch.cat(batch.action)
+        rewards = torch.cat(batch.reward)
+        next_states = torch.cat(batch.next_state)
+        dones = torch.cat(batch.done)
+        mask = torch.cat([torch.tensor([1],dtype=int,device=device) if d==False else torch.tensor([0],dtype=int,device=device) for d in dones])
+        # Update Critic
+        next_actions = self.actor_target(next_states)
+        next_q_targets = self.critic_target(next_states, next_actions).squeeze()
+        q_targets = rewards+ (gamma * next_q_targets * torch.logical_not(dones))
+        q_expected = self.critic_local(states, actions).squeeze()
+        critic_loss = nn.functional.mse_loss(q_expected, q_targets)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1)
+        self.critic_optimizer.step()
+
+        # Update Actor
+        actions_pred = self.actor_local(states)
+        actor_loss = -self.critic_local(states, actions_pred).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # Update Target Networks
+        self.soft_update(self.critic_local, self.critic_target, TAU)
+        self.soft_update(self.actor_local, self.actor_target, TAU)
+
+    def soft_update(self, local_net, target_net, tau):
+        target_net_state_dict = target_net.state_dict()
+        local_net_state_dict = local_net.state_dict()
+        # Soft update: param' = param*tau+param'*(1-tau)
+        for key in local_net_state_dict:
+            target_net_state_dict[key] = tau*local_net_state_dict[key]+target_net_state_dict[key]*(1-tau)
+        target_net.load_state_dict(target_net_state_dict)
+
+class OUNoise:
+    """Ornstein-Uhlenbeck process."""
+    def __init__(self, size, mu=0., theta=0.15, sigma=0.2):
+        """Initialize parameters and noise process."""
+        self.mu = mu * np.ones(size)
+        self.theta = theta
+        self.sigma = sigma
+        self.action_size = size
+        self.reset()
+    def reset(self):
+        """Reset the internal state (= noise) to mean (mu)."""
+        self.state = copy.copy(self.mu)
+
+    def sample(self,scale=1.0):
+        """Update internal state and return it as a noise sample."""
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(self.action_size)
+        self.state = x + dx
+        return np.clip(self.state*scale,-scale,scale)
+
+
+
+if __name__=="__main__":
+    import gym
+    import torch
+    import numpy as np
+
+    env = gym.make('Pendulum-v1')
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.shape[0]
+
+    # Initialize the agent and the replay buffer
+    agent = Agent(state_size, action_size, seed=0)
+    buffer = ReplayBuffer(buffer_size=BUFFER_SIZE, batch_size=BATCH_SIZE)
+    step=0
+    # Training loop
+    num_episodes = 1
+    for i_episode in range(1, num_episodes+1):
+        state,_ = env.reset()
+        state = torch.tensor(state,dtype=torch.float32,device=device).unsqueeze(0)
+        score = 0
+        while True:
+            action = agent.act(state,scale=2)
+            ns, r, _,d,_ = env.step(action)
+            reward = torch.tensor(r,device=device)
+            next_state = torch.tensor(ns.flatten(),dtype=torch.float32,device=device).unsqueeze(0)
+            done = torch.tensor([d],dtype=torch.bool,device=device)
+            action = torch.tensor(action,dtype=torch.float32,device=device)
+            buffer.push(state, action, next_state, reward, done)
+            score += r[0]
+            state = next_state
+            if len(buffer) > buffer.batch_size:
+                agent.learn(buffer.sample())
+            step+=1
+            if done:
+                break
+        print('Episode {:d}, Score: {:.2f}'.format(i_episode, score))
+
+    """Save the agent"""
+    # torch.save(agent,"models/DDPG_Pendulum_10.pkl")
+
+    """Run the trained agent"""
+    env = gym.make('Pendulum-v1',render_mode='rgb_array')
+    plt.ion()
+    state,_ = env.reset()
+    img=env.render()
+    plt.imshow(img)
+    state = torch.tensor(state,dtype=torch.float32,device=device).unsqueeze(0)
+    score = 0
+    while True:
+        action = agent.act(state,scale=2)
+        ns, r, _,d,_ = env.step(action)
+        img=env.render()
+        plt.imshow(img) 
+        time.sleep(.01)
+        reward = torch.tensor(r,device=device)
+        next_state = torch.tensor(ns.flatten(),dtype=torch.float32,device=device).unsqueeze(0)
+        done = torch.tensor([d],dtype=torch.bool,device=device)
+        action = torch.tensor(action,dtype=torch.float32,device=device)
+        buffer.push(state, action, next_state, reward, done)
+        score += r[0]
+        state = next_state
+        if len(buffer) > buffer.batch_size:
+            agent.learn(buffer.sample())
+        step+=1
+        if done:
+            break
+
+plt.ioff()
