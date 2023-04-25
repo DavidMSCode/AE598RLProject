@@ -1,0 +1,251 @@
+# %%
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+import copy
+from collections import deque, namedtuple
+import torch.nn.functional as F
+import time
+import matplotlib
+import matplotlib.pyplot as plt
+is_ipython = 'inline' in matplotlib.get_backend()
+if is_ipython:
+    from IPython import display
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Hyperparameters
+GAMMA = 0.9
+CRITIC_LR = 0.001
+ACTOR_LR = 0.0001
+UPDATE_EVERY = 50
+TEMP_0 = 1
+TDECAY = 0.999
+TMIN = 1
+NAME = "N-Step A2C"
+
+class Actor(nn.Module):
+    def __init__(self, state_size, action_size, num_choices, seed):
+        self.action_size = action_size
+        self.T = TEMP_0
+        self.TDecay = TDECAY
+        self.Tmin = TMIN
+        super(Actor, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, action_size*num_choices)
+        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
+
+    def forward(self, state):
+        x = self.relu(self.fc1(state))
+        x = self.relu(self.fc2(x))
+        x = self.tanh(self.fc3(x))
+        # reshape to (num_actions, num_choices)
+        logits = x.view(self.action_size, -1)
+        # return softmax probabilities
+        probs = F.softmax(logits/self.T, dim=-1)
+        # lower temp
+        self.T = max(self.Tmin, self.T*self.TDecay)
+        return probs
+
+class Critic(nn.Module):
+    def __init__(self, state_size, action_size, seed):
+        super(Critic, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, state):
+        # Predict the value for this state
+        x = self.relu(self.fc1(state))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+"""tuple for storing a transition"""
+Transition = namedtuple(
+    'Transition', ('state', 'action',  'reward',"next_state", 'done'))
+
+class MemoryBuffer:
+    def __init__(self) -> None:
+        """Initialize memory"""
+        self.memory = []
+
+    def push(self, *args):
+        """Save a transition into memory"""
+        self.memory.append(Transition(*args))
+
+    def __len__(self):
+        """Return number of stored memories"""
+        return len(self.memory)
+    
+    def clear(self):
+        self.memory=[]
+
+    def __call__(self):
+        "returns the memory buffer"
+        return self.memory
+
+    def reverse(self):
+        "Returns the memory list in reverse order"
+        return self.memory[::-1]
+    
+class Agent:
+    def __init__(self, state_size, action_size, num_choices, seed, name="default", path=None, load=False):
+        if isinstance(name, str):
+            self.name = name
+        else:
+            raise NameError(
+                "'name' expected a str but a {} was given.".format(type(name)))
+
+        self.state_size = state_size
+        self.action_size = action_size
+        self.t_step=0
+        # Actor Network (w/ Target Network)
+        self.actor_local = Actor(
+            state_size, action_size, num_choices, seed).to(device)
+        self.actor_optimizer = optim.Adam(
+            self.actor_local.parameters(), lr=ACTOR_LR)
+
+        # Critic Network (w/ Target Network)
+        self.critic_local = Critic(state_size, action_size, seed).to(device)
+        self.critic_optimizer = optim.Adam(
+            self.critic_local.parameters(), lr=CRITIC_LR)
+
+    def act(self, state, explore=True):
+        state = torch.FloatTensor(state).to(device)
+        with torch.no_grad():
+            probs = self.actor_local(state).squeeze(0)
+        if explore:
+            dist = torch.distributions.Categorical(
+                probs=probs)  # convert to distribution
+            action = dist.sample().view(-1)  # stochastically choose an action based on probs
+        else:
+            action = torch.argmax(probs)
+        return action
+
+    def learn(self, memory, gamma=GAMMA):
+        #only run every number of steps
+        if self.t_step==0:
+            """This is n step A2C Learning. The reward is back propagated through the td target from end of episode to the beginning"""
+            batch =Transition(*zip(*memory()))
+            reverse = Transition(*zip(*memory.reverse()))
+            states = torch.stack(batch.state)
+            actions = torch.stack(batch.action)
+            TD_targets = []
+            last_state = reverse.state[0]
+            TD_target = self.critic_local(last_state)    #Get terminal state for this sequence of memories (might not be done state)
+            #calculate the TD_targets in reverse order so the reward can get back propagated through the whole episode
+            for i, (reward, done) in enumerate(zip(reverse.reward,reverse.done)):
+                TD_target = reward + gamma*(1-done)*TD_target
+                TD_targets.append(TD_target)
+
+            TD_targets = torch.stack(TD_targets[::-1])               #reverse order of tensors sense they were calcualted in reverse
+            values = self.critic_local(states)
+            advantage = TD_targets-values
+            critic_loss = advantage.pow(2).mean()
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic_optimizer.step()
+
+            probs = self.actor_local(states)
+            dist = torch.distributions.Categorical(probs=probs)
+            log_probs = dist.log_prob(actions)
+            actor_loss = -(log_probs*advantage.detach()).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+        self.t_step=(self.t_step+1)%UPDATE_EVERY
+def plot_learning_curve(episode_returns, episode_means, show_result=False, mean_num=20):
+    """This function plots the learning curve as the network is training or shows the complete learning curve"""
+    fig=plt.figure(1)
+    if show_result:
+        plt.clf()
+        plt.title(NAME+' Learning Curve')
+    else:
+        plt.clf()
+        plt.title(NAME+' Training Run {:d}'.format(i_episode))
+    plt.xlabel('Episode')
+    plt.ylabel('Episode Return')
+    plt.plot(episode_returns)
+    plt.grid(True)
+    # plt.ylim([-10, 110])
+    # Take past x episode returns plot the average
+    if len(episode_returns) >= mean_num and not show_result:
+        episode_means.append(np.mean(episode_returns[-mean_num:-1]))
+    elif not show_result:
+        episode_means.append(np.sum(episode_returns)/len(episode_returns))
+    plt.plot(range(len(episode_means)), episode_means)
+    plt.pause(0.0001)  # pause a bit so that plots are updated
+    if is_ipython:
+        if not show_result:
+            display.display(plt.gcf())
+            display.clear_output(wait=True)
+        else:
+            display.display(plt.gcf())
+    if show_result:
+
+        fig.savefig("images/"+NAME+" Learning Curve.jpg", bbox_inches='tight', dpi=300)
+    return episode_means
+
+
+if __name__ == "__main__":
+    import gym
+    import mobile_env
+    import torch
+    import numpy as np
+
+    env = gym.make('mobile-small-central-v0')
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.shape[0]
+    num_choices = env.action_space.nvec[0]
+    # Initialize the agent and the replay buffer
+    agent = Agent(state_size, action_size, num_choices, seed=0)
+    step = 0
+    # Training loop
+    num_episodes = 2000
+    plt.ion()
+    fig = plt.figure(1,figsize=(10, 6))
+    episode_scores = []
+    episode_means = []
+    memory = MemoryBuffer()
+    for i_episode in range(1, num_episodes+1):
+        """init episode"""
+        state = env.reset()
+        state = torch.tensor(
+            state.flatten(), dtype=torch.float32, device=device)
+        score = 0
+        done = False
+        while not done:
+            """get action and value"""
+            probs = agent.actor_local(state)  # get softmax probabilities for each action
+            dist = torch.distributions.Categorical(probs=probs)  # convert to distribution
+            action = dist.sample().view(-1)  # stochastically choose an action based on probs
+            """step env"""
+            ns, r, done, info = env.step(action.tolist()) 
+            """convert new values to tensor"""
+            reward = torch.tensor(r, dtype=torch.float32, device=device)
+            next_state = torch.tensor(ns.flatten(), dtype=torch.float32, device=device)
+            memory.push(state,action,reward,next_state,done)
+            """step agent"""
+            agent.learn(memory)
+            """cumulative reward, change state and loop"""
+            score += r
+            state = torch.tensor(ns.flatten(), dtype=torch.float32, device=device)
+            step += 1
+        print('Episode {:d}, Score: {:.2f}'.format(i_episode, score))
+        episode_scores.append(score)
+        episode_means = plot_learning_curve(episode_scores, episode_means)
+        #Clear the memory for the next episode
+        memory.clear()
+    plt.ioff()
+    plot_learning_curve(episode_scores, episode_means,show_result=True)
+print("done")
+
+# torch.save(agent,"models/DDPG_Pendulum_10.pkl")
+
+# %%
